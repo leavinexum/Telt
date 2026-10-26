@@ -1,0 +1,1407 @@
+name: Apply Patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to apply the patch to"
+        required: true
+        type: string
+
+      patch_url:
+        description: "Direct patch/archive URL or GitHub Actions artifact URL"
+        required: true
+        type: string
+
+      commit_message:
+        description: "Optional commit message override"
+        required: false
+        type: string
+        default: ""
+
+      strategy:
+        description: "How to create the resulting history"
+        required: true
+        type: choice
+        options:
+          - commit
+          - squash
+          - merge
+          - cherry-pick
+        default: commit
+
+      ignore_whitespace:
+        description: "Ignore whitespace differences"
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: apply-patch-${{ github.repository }}-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  apply-patch:
+    name: Apply patch
+    runs-on: ubuntu-latest
+
+    env:
+      PATCH_URL: ${{ inputs.patch_url }}
+      COMMIT_MESSAGE: ${{ inputs.commit_message }}
+      STRATEGY: ${{ inputs.strategy }}
+      IGNORE_WHITESPACE: ${{ inputs.ignore_whitespace }}
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout target branch
+      # ------------------------------------------------------------
+
+      - name: Checkout target branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      # ------------------------------------------------------------
+      # 2. Configure Git and validate branch
+      # ------------------------------------------------------------
+
+      - name: Configure Git
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git check-ref-format --branch "$TARGET_BRANCH" >/dev/null; then
+            echo "::error::Invalid target branch name."
+            exit 1
+          fi
+
+          if [ "$(git branch --show-current)" != "$TARGET_BRANCH" ]; then
+            echo "::error::Checked-out branch does not match target."
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is not clean."
+            git status --short
+            exit 1
+          fi
+
+          echo "Target branch: $TARGET_BRANCH"
+          git log -1 --oneline --decorate
+          git --version
+
+      # ------------------------------------------------------------
+      # 3. Prepare temporary directories
+      # ------------------------------------------------------------
+
+      - name: Prepare temporary workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$RUNNER_TEMP/apply-patch"
+          rm -rf "$ROOT"
+
+          mkdir -p \
+            "$ROOT/source" \
+            "$ROOT/extracted" \
+            "$ROOT/mailbox" \
+            "$ROOT/patches" \
+            "$ROOT/messages" \
+            "$ROOT/metadata" \
+            "$ROOT/manifest"
+
+          echo "PATCH_WORK=$ROOT" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # 4. Detect GitHub Actions artifact URL
+      # ------------------------------------------------------------
+
+      - name: Detect artifact URL
+        id: source
+        shell: bash
+        env:
+          SOURCE_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+          from urllib.parse import urlparse
+
+          url = os.environ["SOURCE_URL"].strip()
+          parsed = urlparse(url)
+
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit("Only HTTPS source URLs are supported.")
+
+          if parsed.hostname.lower() != "github.com":
+              print("artifact=false")
+              raise SystemExit(0)
+
+          match = re.fullmatch(
+              r"/([^/]+)/([^/]+)/actions/runs/([0-9]+)/artifacts/([0-9]+)/?",
+              parsed.path,
+          )
+
+          if not match:
+              print("artifact=false")
+              raise SystemExit(0)
+
+          owner, repo, run_id, artifact_id = match.groups()
+
+          if repo.endswith(".git"):
+              raise SystemExit("Invalid artifact repository URL.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("artifact=true\n")
+              f.write(f"repository={owner}/{repo}\n")
+              f.write(f"run_id={run_id}\n")
+              f.write(f"artifact_id={artifact_id}\n")
+
+          print(f"Artifact repository: {owner}/{repo}")
+          print(f"Artifact run ID: {run_id}")
+          print(f"Artifact ID: {artifact_id}")
+          PY
+
+      # ------------------------------------------------------------
+      # 5A. Download GitHub Actions artifact
+      # ------------------------------------------------------------
+
+      - name: Download GitHub Actions artifact
+        if: steps.source.outputs.artifact == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          artifact-ids: ${{ steps.source.outputs.artifact_id }}
+          github-token: ${{ secrets.ARTIFACTS_TOKEN || github.token }}
+          path: ${{ runner.temp }}/apply-patch/source
+
+      # ------------------------------------------------------------
+      # 5B. Download a direct file URL
+      # ------------------------------------------------------------
+
+      - name: Download direct patch or archive
+        if: steps.source.outputs.artifact != 'true'
+        shell: bash
+        env:
+          SOURCE_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            --connect-timeout 20 \
+            --max-time 600 \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --output "$PATCH_WORK/source/input.bin" \
+            "$SOURCE_URL"
+
+          if [ ! -s "$PATCH_WORK/source/input.bin" ]; then
+            echo "::error::Downloaded file is empty."
+            exit 1
+          fi
+
+          file "$PATCH_WORK/source/input.bin"
+
+      # ------------------------------------------------------------
+      # 6. Extract supported archives safely
+      # ------------------------------------------------------------
+
+      - name: Install archive tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: Extract archives and discover patch files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import shutil
+          import subprocess
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          root = Path(os.environ["PATCH_WORK"])
+          source = root / "source"
+          extracted = root / "extracted"
+
+          MAX_ARCHIVES = 100
+          MAX_FILES = 10000
+          MAX_TOTAL_SIZE = 2 * 1024 * 1024 * 1024
+
+          total_size = 0
+          archive_count = 0
+          file_count = 0
+          visited = set()
+
+          def safe_name(name):
+              normalized = name.replace("\\", "/")
+              path = PurePosixPath(normalized)
+
+              if path.is_absolute() or ".." in path.parts:
+                  raise RuntimeError(
+                      f"Unsafe archive path: {name!r}"
+                  )
+
+              if not path.parts:
+                  raise RuntimeError(
+                      f"Empty archive path: {name!r}"
+                  )
+
+              return path
+
+          def destination(base, name):
+              relative = safe_name(name)
+              result = base.joinpath(*relative.parts)
+
+              if not result.resolve().is_relative_to(base.resolve()):
+                  raise RuntimeError(
+                      f"Archive path escapes extraction root: {name}"
+                  )
+
+              return result
+
+          def extract_zip(path, out):
+              global total_size, file_count
+
+              with zipfile.ZipFile(path) as archive:
+                  for info in archive.infolist():
+                      target = destination(out, info.filename)
+
+                      mode = (info.external_attr >> 16) & 0xFFFF
+
+                      if mode and (
+                          (mode & 0o170000) not in (0, 0o100000, 0o040000)
+                      ):
+                          raise RuntimeError(
+                              f"Unsupported ZIP entry type: {info.filename}"
+                          )
+
+                      if info.file_size > MAX_TOTAL_SIZE:
+                          raise RuntimeError("ZIP entry is too large.")
+
+                      total_size += info.file_size
+                      file_count += 1
+
+                      if total_size > MAX_TOTAL_SIZE:
+                          raise RuntimeError(
+                              "Extracted data exceeds the size limit."
+                          )
+
+                      if file_count > MAX_FILES:
+                          raise RuntimeError(
+                              "Archive contains too many files."
+                          )
+
+                      if info.is_dir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+
+                      target.parent.mkdir(parents=True, exist_ok=True)
+
+                      with archive.open(info) as src, target.open("wb") as dst:
+                          shutil.copyfileobj(src, dst)
+
+          def extract_tar(path, out):
+              global total_size, file_count
+
+              with tarfile.open(path, "r:*") as archive:
+                  for info in archive:
+                      target = destination(out, info.name)
+
+                      if info.isdir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+
+                      if not info.isfile():
+                          raise RuntimeError(
+                              f"Unsupported TAR entry type: {info.name}"
+                          )
+
+                      total_size += info.size
+                      file_count += 1
+
+                      if total_size > MAX_TOTAL_SIZE:
+                          raise RuntimeError(
+                              "Extracted data exceeds the size limit."
+                          )
+
+                      if file_count > MAX_FILES:
+                          raise RuntimeError(
+                              "Archive contains too many files."
+                          )
+
+                      target.parent.mkdir(parents=True, exist_ok=True)
+
+                      src = archive.extractfile(info)
+
+                      if src is None:
+                          raise RuntimeError(
+                              f"Cannot read TAR entry: {info.name}"
+                          )
+
+                      with src, target.open("wb") as dst:
+                          shutil.copyfileobj(src, dst)
+
+          def extract_7z(path, out):
+              global total_size, file_count
+
+              listing = subprocess.run(
+                  ["7z", "l", "-slt", str(path)],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              for line in listing.stdout.splitlines():
+                  if not line.startswith("Path = "):
+                      continue
+
+                  name = line[len("Path = "):].strip()
+
+                  if name == str(path):
+                      continue
+
+                  safe_name(name)
+
+              subprocess.run(
+                  ["7z", "x", "-y", f"-o{out}", str(path)],
+                  check=True,
+              )
+
+              for item in out.rglob("*"):
+                  if item.is_file():
+                      file_count += 1
+                      total_size += item.stat().st_size
+
+                      if file_count > MAX_FILES:
+                          raise RuntimeError(
+                              "Archive contains too many files."
+                          )
+
+                      if total_size > MAX_TOTAL_SIZE:
+                          raise RuntimeError(
+                              "Extracted data exceeds the size limit."
+                          )
+
+          def is_archive(path):
+              if zipfile.is_zipfile(path):
+                  return "zip"
+
+              try:
+                  if tarfile.is_tarfile(path):
+                      return "tar"
+              except (OSError, tarfile.TarError):
+                  pass
+
+              suffix = path.suffix.lower()
+
+              if suffix in {".7z", ".rar"}:
+                  return "7z"
+
+              return None
+
+          extracted.mkdir(parents=True, exist_ok=True)
+
+          for item in sorted(source.rglob("*")):
+              if item.is_file():
+                  target = destination(
+                      extracted,
+                      item.relative_to(source).as_posix(),
+                  )
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(item, target)
+
+          while True:
+              candidates = sorted(
+                  p for p in extracted.rglob("*")
+                  if p.is_file()
+                  and p not in visited
+                  and is_archive(p)
+              )
+
+              if not candidates:
+                  break
+
+              path = candidates[0]
+              visited.add(path)
+              archive_count += 1
+
+              if archive_count > MAX_ARCHIVES:
+                  raise RuntimeError("Too many nested archives.")
+
+              out = path.parent / (
+                  path.name + ".extracted"
+              )
+
+              out.mkdir(parents=True, exist_ok=True)
+
+              kind = is_archive(path)
+
+              print(f"Extracting {path.relative_to(extracted)} ({kind})")
+
+              if kind == "zip":
+                  extract_zip(path, out)
+              elif kind == "tar":
+                  extract_tar(path, out)
+              else:
+                  extract_7z(path, out)
+
+          patches = []
+
+          for path in sorted(extracted.rglob("*")):
+              if not path.is_file():
+                  continue
+
+              if path.suffix.lower() not in {".patch", ".diff"}:
+                  continue
+
+              patches.append(path)
+
+          if not patches:
+              for path in sorted(extracted.rglob("*")):
+                  if not path.is_file():
+                      continue
+
+                  if path in visited:
+                      continue
+
+                  try:
+                      with path.open("rb") as f:
+                          head = f.read(1024 * 1024)
+                  except OSError:
+                      continue
+
+                  if b"\x00" in head:
+                      continue
+
+                  if (
+                      b"diff --git " in head
+                      or b"Mon Sep 17 00:00:00 2001" in head
+                  ):
+                      patches.append(path)
+
+          if not patches:
+              raise SystemExit(
+                  "No patch files were found in the downloaded content."
+              )
+
+          print()
+          print(f"Archives extracted: {archive_count}")
+          print(f"Candidate patch files: {len(patches)}")
+
+          for path in patches:
+              print(f"  {path.relative_to(extracted)}")
+          PY
+
+      # ------------------------------------------------------------
+      # 7. Build patch metadata manifest
+      # ------------------------------------------------------------
+
+      - name: Build patch metadata manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from email.utils import parsedate_to_datetime
+          from pathlib import Path
+
+          root = Path(os.environ["PATCH_WORK"])
+          extracted = root / "extracted"
+          patch_dir = root / "patches"
+          msg_dir = root / "messages"
+          meta_dir = root / "metadata"
+          mailbox_dir = root / "mailbox"
+          manifest_path = root / "manifest" / "manifest.jsonl"
+
+          for directory in (
+              patch_dir, msg_dir, meta_dir, mailbox_dir
+          ):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def sha256(path):
+              h = hashlib.sha256()
+
+              with path.open("rb") as f:
+                  for block in iter(
+                      lambda: f.read(1024 * 1024), b""
+                  ):
+                      h.update(block)
+
+              return h.hexdigest()
+
+          def natural_key(path):
+              return [
+                  int(x) if x.isdigit() else x.lower()
+                  for x in re.split(r"([0-9]+)", str(path))
+              ]
+
+          def parse_author(value):
+              match = re.match(
+                  r"^(.*?)\s*<([^<>]+)>\s*$",
+                  value.strip(),
+              )
+
+              if match:
+                  return (
+                      match.group(1).strip(),
+                      match.group(2).strip(),
+                  )
+
+              return value.strip(), ""
+
+          def normalize_date(value):
+              try:
+                  return parsedate_to_datetime(
+                      value.strip()
+                  ).isoformat()
+              except Exception:
+                  return value.strip()
+
+          def split_patch_content(data):
+              """Separate commit metadata/message from the Git diff."""
+              if isinstance(data, bytes):
+                  text = data.decode("utf-8", "replace")
+              else:
+                  text = data
+
+              lines = text.splitlines()
+
+              diff_index = next(
+                  (
+                      i for i, line in enumerate(lines)
+                      if line.startswith("diff --git ")
+                  ),
+                  None,
+              )
+
+              if diff_index is None:
+                  raise ValueError("No diff --git header found.")
+
+              prefix = lines[:diff_index]
+
+              # Exclude the standard separator and diffstat.
+              separator = next(
+                  (
+                      i for i, line in enumerate(prefix)
+                      if line.strip() == "---"
+                  ),
+                  None,
+              )
+
+              if separator is not None:
+                  prefix = prefix[:separator]
+
+              metadata_part = "\n".join(prefix).strip("\n")
+              diff_part = "\n".join(lines[diff_index:]).rstrip() + "\n"
+
+              return metadata_part, diff_part
+
+          def parse_metadata(data):
+              """
+              Parse metadata from a standalone patch.
+
+              Supported headers:
+                  Author: John Doe <john@example.com>
+                  From: John Doe <john@example.com>
+                  Date: ...
+                  Subject: ...
+
+              If Subject is absent, the first paragraph after the
+              metadata headers becomes the subject.
+              """
+
+              metadata_part, diff_part = split_patch_content(data)
+              lines = metadata_part.splitlines()
+
+              author_name = ""
+              author_email = ""
+              author_date = ""
+              subject = ""
+              body = ""
+
+              header_re = re.compile(
+                  r"^(Author|From|Date|Subject):\s*(.*)$",
+                  re.IGNORECASE,
+              )
+
+              i = 0
+              explicit_subject = False
+
+              # Parse metadata headers.
+              while i < len(lines):
+                  line = lines[i]
+                  match = header_re.match(line)
+
+                  if match:
+                      key = match.group(1).lower()
+                      value = match.group(2).strip()
+
+                      if key == "author":
+                          author_name, author_email = parse_author(value)
+
+                      elif key == "from":
+                          if not author_name:
+                              author_name, author_email = parse_author(value)
+
+                      elif key == "date":
+                          author_date = normalize_date(value)
+
+                      elif key == "subject":
+                          subject = value
+                          explicit_subject = True
+
+                      i += 1
+                      continue
+
+                  # RFC/mail-style continuation lines for Subject.
+                  if line[:1].isspace() and explicit_subject:
+                      subject += " " + line.strip()
+                      i += 1
+                      continue
+
+                  # The metadata header block ends at the first blank line.
+                  if not line.strip():
+                      i += 1
+                      break
+
+                  # Non-header text starts the commit message.
+                  break
+
+              # Skip blank lines between metadata and commit message.
+              while i < len(lines) and not lines[i].strip():
+                  i += 1
+
+              message_lines = lines[i:]
+
+              # If Subject was not supplied, use the first paragraph.
+              if not subject and message_lines:
+                  subject_lines = []
+
+                  while message_lines and message_lines[0].strip():
+                      subject_lines.append(message_lines.pop(0).strip())
+
+                  subject = " ".join(subject_lines).strip()
+
+                  # Remove the separator between subject and body.
+                  while message_lines and not message_lines[0].strip():
+                      message_lines.pop(0)
+
+              body = "\n".join(message_lines).strip()
+
+              return {
+                  "author_name": author_name.strip(),
+                  "author_email": author_email.strip(),
+                  "author_date": author_date.strip(),
+                  "subject": subject.strip(),
+                  "body": body,
+                  "diff": diff_part,
+              }
+
+          candidates = sorted(
+              (
+                  p for p in extracted.rglob("*")
+                  if p.is_file()
+                  and p.suffix.lower() in {".patch", ".diff"}
+              ),
+              key=natural_key,
+          )
+
+          # If extension-based discovery found nothing, inspect contents.
+          if not candidates:
+              for p in sorted(extracted.rglob("*"), key=natural_key):
+                  if not p.is_file():
+                      continue
+
+                  try:
+                      data = p.read_bytes()
+                  except OSError:
+                      continue
+
+                  if b"\x00" not in data[:8192] and (
+                      b"diff --git " in data
+                  ):
+                      candidates.append(p)
+
+          manifest = []
+          index = 0
+
+          for source in candidates:
+              data = source.read_bytes()
+
+              if b"\x00" in data[:8192]:
+                  continue
+
+              is_mailbox = bool(
+                  re.search(
+                      rb"^From [0-9a-fA-F]{40} Mon Sep 17 00:00:00 2001$",
+                      data,
+                      re.MULTILINE,
+                  )
+              )
+
+              messages = []
+
+              if is_mailbox:
+                  split_dir = mailbox_dir / f"source-{index + 1:04d}"
+                  split_dir.mkdir(parents=True, exist_ok=True)
+
+                  subprocess.run(
+                      [
+                          "git", "mailsplit", "-b",
+                          "--keep-cr",
+                          f"-o{split_dir}",
+                          "--", str(source),
+                      ],
+                      check=True,
+                      capture_output=True,
+                  )
+
+                  for mail in sorted(split_dir.iterdir()):
+                      if not mail.is_file():
+                          continue
+
+                      patch_file = patch_dir / "mail.patch"
+                      message_file = msg_dir / "mail.txt"
+
+                      proc = subprocess.run(
+                          [
+                              "git", "mailinfo",
+                              "-b",
+                              "--no-scissors",
+                              "--quoted-cr=strip",
+                              str(message_file),
+                              str(patch_file),
+                          ],
+                          input=mail.read_bytes(),
+                          capture_output=True,
+                          check=True,
+                      )
+
+                      metadata = {
+                          "author_name": "",
+                          "author_email": "",
+                          "author_date": "",
+                          "subject": "",
+                          "body": "",
+                      }
+
+                      for line in proc.stdout.decode(
+                          "utf-8", "replace"
+                      ).splitlines():
+                          if line.startswith("Author:"):
+                              (
+                                  metadata["author_name"],
+                                  metadata["author_email"],
+                              ) = parse_author(
+                                  line[len("Author:"):].strip()
+                              )
+                          elif line.startswith("Email:"):
+                              metadata["author_email"] = (
+                                  line[len("Email:"):].strip()
+                              )
+                          elif line.startswith("Date:"):
+                              metadata["author_date"] = normalize_date(
+                                  line[len("Date:"):].strip()
+                              )
+                          elif line.startswith("Subject:"):
+                              metadata["subject"] = (
+                                  line[len("Subject:"):].strip()
+                              )
+
+                      metadata["body"] = (
+                          message_file.read_text(
+                              encoding="utf-8",
+                              errors="replace",
+                          ).strip()
+                          if message_file.exists()
+                          else ""
+                      )
+
+                      if patch_file.exists() and patch_file.stat().st_size:
+                          messages.append(
+                              (metadata, patch_file.read_bytes())
+                          )
+
+              else:
+                  try:
+                      parsed = parse_metadata(data)
+                  except ValueError:
+                      continue
+
+                  metadata = {
+                      "author_name": parsed["author_name"],
+                      "author_email": parsed["author_email"],
+                      "author_date": parsed["author_date"],
+                      "subject": parsed["subject"],
+                      "body": parsed["body"],
+                  }
+
+                  diff = parsed["diff"]
+                  messages.append((metadata, diff.encode("utf-8")))
+
+              for metadata, diff_bytes in messages:
+                  if b"diff --git " not in diff_bytes:
+                      continue
+
+                  index += 1
+
+                  patch_path = patch_dir / f"{index:04d}.patch"
+                  message_path = msg_dir / f"{index:04d}.txt"
+                  metadata_path = meta_dir / f"{index:04d}.json"
+
+                  patch_path.write_bytes(diff_bytes)
+
+                  subject = metadata["subject"].strip()
+                  body = metadata["body"].strip()
+
+                  message = (
+                      f"{subject}\n\n{body}"
+                      if subject and body
+                      else subject or body
+                  )
+
+                  message_path.write_text(
+                      message.rstrip() + "\n" if message else "",
+                      encoding="utf-8",
+                  )
+
+                  metadata_path.write_text(
+                      json.dumps(
+                          metadata,
+                          ensure_ascii=False,
+                          indent=2,
+                      ) + "\n",
+                      encoding="utf-8",
+                  )
+
+                  manifest.append({
+                      "index": index,
+                      "source_file": str(
+                          source.relative_to(extracted)
+                      ),
+                      "patch_file": str(patch_path),
+                      "message_file": str(message_path),
+                      "metadata_file": str(metadata_path),
+                      "patch_sha256": sha256(patch_path),
+                      "subject": subject,
+                      "body": body,
+                      "author_name": metadata["author_name"],
+                      "author_email": metadata["author_email"],
+                      "author_date": metadata["author_date"],
+                      "subject_source": "patch" if subject else "missing",
+                  })
+
+          if not manifest:
+              raise SystemExit(
+                  "No valid Git patches were found."
+              )
+
+          manifest_path.write_text(
+              "".join(
+                  json.dumps(item, ensure_ascii=False) + "\n"
+                  for item in manifest
+              ),
+              encoding="utf-8",
+          )
+
+          print(f"Patch count: {len(manifest)}")
+
+          for entry in manifest:
+              print(
+                  f"{entry['index']:04d} | "
+                  f"{entry['subject'] or '(subject missing)'}"
+              )
+
+              print(
+                  f"  Author: {entry['author_name'] or '(not supplied)'}"
+              )
+              print(
+                  f"  Body: {'yes' if entry['body'] else 'no'}"
+              )
+          PY
+
+      # ------------------------------------------------------------
+      # 8. Create a temporary branch for merge/cherry-pick
+      # ------------------------------------------------------------
+
+      - name: Create temporary patch branch
+        if: inputs.strategy == 'merge' || inputs.strategy == 'cherry-pick'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEMP_BRANCH="patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          git switch -c "$TEMP_BRANCH"
+
+          echo "TEMP_BRANCH=$TEMP_BRANCH" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # 9. Apply patches and create commits
+      # ------------------------------------------------------------
+
+      - name: Apply patches and create commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ["PATCH_WORK"])
+          manifest_path = root / "manifest" / "manifest.jsonl"
+
+          strategy = os.environ["STRATEGY"]
+          override = os.environ.get("COMMIT_MESSAGE", "").strip()
+          ignore_whitespace = (
+              os.environ.get("IGNORE_WHITESPACE", "true").lower()
+              == "true"
+          )
+
+          entries = [
+              json.loads(line)
+              for line in manifest_path.read_text(
+                  encoding="utf-8"
+              ).splitlines()
+              if line.strip()
+          ]
+
+          def git(args, check=True, capture=False):
+              return subprocess.run(
+                  ["git", *map(str, args)],
+                  check=check,
+                  cwd=os.environ["GITHUB_WORKSPACE"],
+                  text=capture,
+                  stdout=subprocess.PIPE if capture else None,
+                  stderr=subprocess.PIPE if capture else None,
+              )
+
+          def out(args):
+              return git(args, capture=True).stdout.strip()
+
+          def staged_diff():
+              return out([
+                  "diff", "--cached",
+                  "--no-ext-diff",
+                  "--unified=3",
+              ])
+
+          def staged_paths():
+              return [
+                  x for x in out([
+                      "diff", "--cached", "--name-only",
+                      "--find-renames",
+                  ]).splitlines() if x
+              ]
+
+          def subject_from_diff():
+              diff = staged_diff()
+              paths = staged_paths()
+
+              if not diff.strip():
+                  raise RuntimeError(
+                      "Cannot generate a subject from an empty diff."
+                  )
+
+              added = 0
+              removed = 0
+
+              for line in diff.splitlines():
+                  if line.startswith(("+++ ", "--- ")):
+                      continue
+                  if line.startswith("+"):
+                      added += 1
+                  elif line.startswith("-"):
+                      removed += 1
+
+              symbols = []
+
+              for line in diff.splitlines():
+                  if line.startswith("@@"):
+                      match = re.search(
+                          r"@@.*@@\s*(.*)$",
+                          line,
+                      )
+                      if match and match.group(1).strip():
+                          symbols.append(match.group(1).strip())
+
+              if symbols:
+                  match = re.search(
+                      r"([A-Za-z_$][\w$]*)\s*\(",
+                      symbols[0],
+                  )
+
+                  if match:
+                      name = match.group(1)
+
+                      if added and not removed:
+                          return f"Add or extend {name}"
+
+                      if removed and not added:
+                          return f"Remove {name}"
+
+                      return f"Update {name}"
+
+              if len(paths) == 1:
+                  name = Path(paths[0]).name
+                  name = name.rsplit(".", 1)[0] if "." in name else name
+
+                  if added and not removed:
+                      return f"Add {name}"
+                  if removed and not added:
+                      return f"Remove {name}"
+
+                  return f"Update {name}"
+
+              if paths:
+                  names = [
+                      Path(path).name.rsplit(".", 1)[0]
+                      for path in paths[:3]
+                  ]
+
+                  if len(paths) == 2:
+                      return f"Update {names[0]} and {names[1]}"
+
+                  if len(paths) == 3:
+                      return f"Update {names[0]}, {names[1]} and {names[2]}"
+
+                  return (
+                      f"Update {names[0]}, {names[1]} "
+                      f"and {len(paths) - 2} more"
+                  )
+
+              raise RuntimeError(
+                  "Unable to generate a subject."
+              )
+
+          def write_message(index, subject, body):
+              message = (
+                  f"{subject}\n\n{body}"
+                  if body.strip()
+                  else subject
+              )
+
+              path = root / "manifest" / f"commit-{index:04d}.txt"
+              path.write_text(
+                  message.rstrip() + "\n",
+                  encoding="utf-8",
+              )
+
+              return path
+
+          def commit(index, subject, body, entry):
+              subject = subject.strip()
+
+              if not subject:
+                  raise RuntimeError(
+                      f"[{index}] Empty commit subject."
+                  )
+
+              message_file = write_message(
+                  index, subject, body
+              )
+
+              args = [
+                  "commit",
+                  "--no-verify",
+                  "-F", str(message_file),
+              ]
+
+              author_name = entry.get("author_name", "").strip()
+              author_email = entry.get("author_email", "").strip()
+              author_date = entry.get("author_date", "").strip()
+
+              if author_name and author_email:
+                  args.extend([
+                      "--author",
+                      f"{author_name} <{author_email}>",
+                  ])
+
+              if author_date:
+                  args.extend(["--date", author_date])
+
+              git(args)
+
+              actual_subject = out([
+                  "show", "-s", "--format=%s", "HEAD",
+              ])
+
+              if actual_subject != subject:
+                  raise RuntimeError(
+                      f"[{index}] Commit subject verification failed."
+                  )
+
+              return out(["rev-parse", "HEAD"])
+
+          def apply_patch(entry):
+              patch = Path(entry["patch_file"])
+
+              if not patch.is_file():
+                  raise RuntimeError(
+                      f"Missing patch: {patch}"
+                  )
+
+              digest = hashlib.sha256(
+                  patch.read_bytes()
+              ).hexdigest()
+
+              if digest != entry["patch_sha256"]:
+                  raise RuntimeError(
+                      f"SHA-256 mismatch for patch #{entry['index']}."
+                  )
+
+              args = ["apply", "--index", "--recount"]
+
+              if ignore_whitespace:
+                  args.extend([
+                      "--ignore-space-change",
+                      "--ignore-whitespace",
+                  ])
+
+              args.append(str(patch))
+              git(args)
+
+              result = git(
+                  ["diff", "--cached", "--quiet"],
+                  check=False,
+              )
+
+              if result.returncode == 0:
+                  raise RuntimeError(
+                      f"Patch #{entry['index']} produced no changes."
+                  )
+
+              if result.returncode != 1:
+                  raise RuntimeError(
+                      f"Unable to verify staged changes for patch "
+                      f"#{entry['index']}."
+                  )
+
+          def ensure_clean():
+              status = out([
+                  "status", "--porcelain",
+              ])
+
+              if status:
+                  raise RuntimeError(
+                      "Working tree is not clean:\n" + status
+                  )
+
+          commits = []
+
+          if strategy in ("commit", "merge", "cherry-pick"):
+              for entry in entries:
+                  index = entry["index"]
+
+                  print(f"Applying patch #{index}: {entry['source_file']}")
+
+                  apply_patch(entry)
+
+                  supplied_subject = entry.get("subject", "").strip()
+                  subject = supplied_subject or subject_from_diff()
+                  body = entry.get("body", "").strip()
+
+                  if len(entries) == 1 and override:
+                      subject = override
+                      body = ""
+
+                  commit_hash = commit(
+                      index, subject, body, entry
+                  )
+
+                  commits.append(commit_hash)
+                  ensure_clean()
+
+          elif strategy == "squash":
+              for entry in entries:
+                  print(
+                      f"Applying patch #{entry['index']}: "
+                      f"{entry['source_file']}"
+                  )
+                  apply_patch(entry)
+
+              supplied_subjects = [
+                  entry.get("subject", "").strip()
+                  for entry in entries
+                  if entry.get("subject", "").strip()
+              ]
+
+              if override:
+                  subject = override
+              elif len(entries) == 1 and supplied_subjects:
+                  subject = supplied_subjects[0]
+              else:
+                  subject = subject_from_diff()
+
+              bodies = [
+                  entry.get("body", "").strip()
+                  for entry in entries
+                  if entry.get("body", "").strip()
+              ]
+
+              body = "\n\n".join(bodies)
+
+              last_entry = (
+                  entries[0] if len(entries) == 1 else {}
+              )
+
+              commit_hash = commit(
+                  1, subject, body, last_entry
+              )
+
+              commits.append(commit_hash)
+              ensure_clean()
+
+          else:
+              raise RuntimeError(
+                  f"Unsupported strategy: {strategy}"
+              )
+
+          (root / "manifest" / "commits.txt").write_text(
+              "".join(commit_hash + "\n" for commit_hash in commits),
+              encoding="utf-8",
+          )
+
+          print()
+          print(f"Strategy: {strategy}")
+          print(f"Created commits: {len(commits)}")
+          for commit_hash in commits:
+              print(commit_hash)
+          PY
+
+      # ------------------------------------------------------------
+      # 10. Merge temporary branch
+      # ------------------------------------------------------------
+
+      - name: Merge patch branch
+        if: inputs.strategy == 'merge'
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          git switch "$TARGET_BRANCH"
+
+          git merge \
+            --no-ff \
+            --no-edit \
+            "$TEMP_BRANCH"
+
+          git log -5 --oneline --decorate
+
+      # ------------------------------------------------------------
+      # 11. Cherry-pick commits
+      # ------------------------------------------------------------
+
+      - name: Cherry-pick patch commits
+        if: inputs.strategy == 'cherry-pick'
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          git switch "$TARGET_BRANCH"
+
+          while IFS= read -r COMMIT; do
+            [ -n "$COMMIT" ] || continue
+
+            git cherry-pick "$COMMIT"
+          done < "$PATCH_WORK/manifest/commits.txt"
+
+          git log -5 --oneline --decorate
+
+      # ------------------------------------------------------------
+      # 12. Final verification
+      # ------------------------------------------------------------
+
+      - name: Final verification
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$(git branch --show-current)" != "$TARGET_BRANCH" ]; then
+            echo "::error::Final branch does not match target."
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is not clean."
+            git status --short
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "FINAL BRANCH"
+          echo "========================================"
+          git branch --show-current
+
+          echo
+          echo "========================================"
+          echo "FINAL HEAD"
+          echo "========================================"
+          git log -1 --oneline --decorate
+
+          echo
+          echo "========================================"
+          echo "RECENT HISTORY"
+          echo "========================================"
+          git log -10 --oneline --decorate
+
+          echo
+          echo "Working tree is clean."
+
+      # ------------------------------------------------------------
+      # 13. Push target branch
+      # ------------------------------------------------------------
+
+      - name: Push target branch
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          git push origin "HEAD:$TARGET_BRANCH"
+
+          echo "Successfully pushed $TARGET_BRANCH"
